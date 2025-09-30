@@ -1,0 +1,153 @@
+include:
+  - project: 'fp/mwp-managed-svcs/site-hosting-demo-project'
+    ref: 'develop'
+    file: '.gitlab-ci/ip-set-validation-jobs.yml'
+  - project: 'fp/mwp-managed-svcs/managed-site-hosting-tools'
+    ref: 'prod'
+    file: 'msh-ci.yml'
+
+stages:
+  - build
+  - clmscan
+  - ip_set_validation
+  - upload_assets         # required by msh-ci template
+  - site_deploy           # we’ll run our docker deploy here
+  - site_deploy_environment
+  - etch_upload
+
+variables:
+  # The template expects static assets here; we'll generate a placeholder.
+  STATIC_ASSETS: build/client
+  DEMO_PROJECT_DEPLOY_CONFIG_PATH: ./site-deployment-config.json
+  PACKAGE_NAME: agent-desktop-assist
+
+  # Container image for the Streamlit app
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+# --- 0) CLM scan & IP set validation (kept) -----------------------------------
+request_clmscan:
+  stage: clmscan
+  tags:
+    - kubernetes, linux, default
+  image: gitlab.registry.docker.site.gs.com:443/dx/sdlc-tools/gitlab-clm-plugin/gitlab-clm-plugin:latest
+  before_script: []
+  script:
+    - /opt/clm/request-clmscan.sh ${CI_PROJECT_DIR}
+
+ip_set_validation:
+  stage: ip_set_validation
+  extends: .ip_set_validation
+
+# --- 1) Build the Streamlit Docker image & push -------------------------------
+# (This is the real app build)
+docker_build_push:
+  stage: build
+  image: docker:27.1
+  services:
+    - docker:27.1-dind
+  before_script:
+    - apk add --no-cache bash
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build -f Dockerfile -t "$IMAGE_TAG" .
+    - docker push "$IMAGE_TAG"
+    - docker tag "$IMAGE_TAG" "$CI_REGISTRY_IMAGE:latest"
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+  only:
+    - branches
+
+# --- 2) Create a tiny static artifact so msh-ci jobs don't fail ----------------
+# (This satisfies STATIC_ASSETS contract; it's a no-op for Streamlit)
+prepare_placeholder_assets:
+  stage: build
+  image: alpine:3.20
+  script:
+    - mkdir -p "$STATIC_ASSETS"
+    - printf "<!doctype html><meta http-equiv='refresh' content='0;url=/'>Streamlit app is deploying…\n" > "$STATIC_ASSETS/index.html"
+    - echo "commit=$CI_COMMIT_SHORT_SHA time=$(date -u +%FT%TZ)" > placeholder.txt
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/${STATIC_ASSETS}
+      - placeholder.txt
+      - "*.env"
+      - debugLogs.log
+    expire_in: 1 week
+  needs: []
+
+# --- 3) Upload assets via the org template (uses artifact created above) ------
+upload_assets:
+  extends: .upload_assets
+  stage: upload_assets
+  needs: ["prepare_placeholder_assets"]
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/${STATIC_ASSETS}
+      - placeholder.txt
+      - "*.env"
+      - debugLogs.log
+    expire_in: 1 week
+
+# --- 4) Deploy the Streamlit container to your hosted server -------------------
+# If you already have an app host VM/EC2 with Docker, this job logs in over SSH
+# and restarts the container. Set CI vars: DEPLOY_HOST, DEPLOY_USER, DEPLOY_KEY,
+# (optional) DEPLOY_PORT, plus CI_REGISTRY_USER/CI_REGISTRY_PASSWORD (usually preset).
+deploy_streamlit:
+  stage: site_deploy
+  image: docker:27.1
+  services:
+    - docker:27.1-dind
+  needs: ["docker_build_push", "upload_assets"]
+  variables:
+    DEPLOY_PORT: ${DEPLOY_PORT:-22}
+    CONTAINER_NAME: streamlit-app
+  before_script:
+    - apk add --no-cache openssh-client bash
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - eval "$(ssh-agent -s)"
+    - echo "$DEPLOY_KEY" | tr -d '\r' | ssh-add -
+    - printf "Host %s\n  User %s\n  Port %s\n  StrictHostKeyChecking no\n" "$DEPLOY_HOST" "$DEPLOY_USER" "$DEPLOY_PORT" >> ~/.ssh/config
+  script: |
+    ssh "$DEPLOY_HOST" bash -s <<'EOS'
+      set -euo pipefail
+      # pull latest app image from registry and restart container
+      docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+      docker pull "$CI_REGISTRY_IMAGE:latest"
+      docker rm -f $CONTAINER_NAME || true
+      docker run -d --name $CONTAINER_NAME \
+        --restart=always \
+        -p 8501:8501 \
+        -e STREAMLIT_SERVER_PORT=8501 \
+        "$CI_REGISTRY_IMAGE:latest"
+    EOS
+
+# --- 5) (Optional) Keep your environment blocks unchanged ---------------------
+environment_dev:
+  stage: site_deploy_environment
+  script:
+    - echo "Deploy to dev server"
+  environment:
+    name: dev
+    url: https://docs.agent.cft.site.gs.com
+  only:
+    - feature-DARE-30374-poc
+
+# --- 6) Keep your cloud etch uploader as-is (if required) ---------------------
+cloud_etch_upload:
+  stage: etch_upload
+  tags:
+    - standard
+  image: registry.aws.site.gs.com:443/dx/ete/cloudetch-uploader:current
+  script:
+    - $CLOUD_ETCH_UPLOAD
+
+
+FROM python:3.11-slim
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
+    STREAMLIT_SERVER_HEADLESS=true STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_SERVER_PORT=8501
+WORKDIR /app
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip && pip install -r requirements.txt
+COPY . .
+EXPOSE 8501
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
