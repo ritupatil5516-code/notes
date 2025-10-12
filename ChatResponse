@@ -1,0 +1,47 @@
+def _to_text(resp) -> str:
+    """
+    Normalize LlamaIndex ChatResponse (or provider response) to plain text.
+    """
+    # LlamaIndex ChatResponse has .message.content
+    try:
+        if hasattr(resp, "message") and hasattr(resp.message, "content"):
+            return resp.message.content or ""
+    except Exception:
+        pass
+
+    # Some providers expose .raw or .response with content
+    for attr in ("raw", "response", "text"):
+        if hasattr(resp, attr):
+            v = getattr(resp, attr)
+            if isinstance(v, str):
+                return v
+            # OpenAI-like objects: v.choices[0].message.content
+            try:
+                choices = getattr(v, "choices", None)
+                if choices:
+                    msg = choices[0].message
+                    return getattr(msg, "content", "") or msg.get("content", "")
+            except Exception:
+                pass
+
+    # Fallback
+    return str(resp or "")
+
+def _extract_json_block(text: str) -> str:
+    """
+    Extract the outermost JSON object or array from free text (tolerates code fences).
+    """
+    # strip code fences if present
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+
+    # try object
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start:end+1]
+
+    # try array
+    start, end = text.find("["), text.rfind("]")
+    if start >= 0 and end > start:
+        return text[start:end+1]
+
+    return text  # return as-is; json.loads may raise
