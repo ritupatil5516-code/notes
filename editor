@@ -1,0 +1,75 @@
+# utils_json.py
+from __future__ import annotations
+from typing import Any, Dict, List, Callable
+from datetime import datetime
+import jmespath  # pip install jmespath
+
+def _ensure_list(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list): return data
+    if isinstance(data, dict): return [data]
+    return []
+
+def _to_dt(s: str | None) -> datetime | None:
+    if not s: return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def get_field(obj: Dict[str, Any], key_path: str) -> Any:
+    """
+    Return obj[key_path] using JMESPath (supports dot paths, array indexes, filters).
+    Example: "accountStatus", "summary.flags[0]", "statements[?period=='2025-03']|[0].closingDateTime"
+    """
+    return jmespath.search(key_path, obj)
+
+def find_latest(rows: List[Dict[str, Any]], ts_field: str, value_path: str) -> Any:
+    """
+    Return value_path from the row with the latest ts_field.
+    Example: find_latest(statements, 'closingDateTime', 'interestCharged')
+    """
+    items = _ensure_list(rows)
+    items = [r for r in items if _to_dt(jmespath.search(ts_field, r))]
+    if not items: return None
+    items.sort(key=lambda r: _to_dt(jmespath.search(ts_field, r)) or datetime.min, reverse=True)
+    return jmespath.search(value_path, items[0])
+
+def sum_where(rows: List[Dict[str, Any]], value_path: str, where_expr: str | None = None) -> float:
+    """
+    Sum numbers selected by value_path, optionally after filtering with JMESPath.
+    Example: sum_where(transactions, 'amount', "[?transactionStatus=='POSTED' && contains(displayTransactionType,'PURCHASE')]")
+    """
+    items = _ensure_list(rows)
+    if where_expr:
+        # where_expr selects a subset of rows, e.g., "[?amount > `0`]"
+        items = jmespath.search(where_expr, items) or []
+    total = 0.0
+    for r in items:
+        val = jmespath.search(value_path, r)
+        try:
+            total += float(val or 0)
+        except Exception:
+            continue
+    return round(total, 2)
+
+def topk_by_sum(rows: List[Dict[str, Any]], group_key: str, value_path: str,
+                where_expr: str | None = None, k: int = 5) -> List[Dict[str, Any]]:
+    """
+    Group by group_key and sum value_path; return top-k.
+    Example: topk_by_sum(transactions, 'merchantName', 'amount',
+            "[?transactionStatus=='POSTED' && contains(displayTransactionType,'PURCHASE')]", 5)
+    """
+    items = _ensure_list(rows)
+    if where_expr:
+        items = jmespath.search(where_expr, items) or []
+    agg: Dict[str, float] = {}
+    for r in items:
+        key = jmespath.search(group_key, r) or "UNKNOWN"
+        try:
+            amt = float(jmespath.search(value_path, r) or 0)
+        except Exception:
+            amt = 0.0
+        agg[str(key)] = agg.get(str(key), 0.0) + amt
+    ranked = sorted(({"key": k, "total": round(v, 2)} for k, v in agg.items()),
+                    key=lambda x: x["total"], reverse=True)
+    return ranked[:k]
