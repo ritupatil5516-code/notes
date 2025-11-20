@@ -1,0 +1,796 @@
+"""
+poc.py - ONE-FILE POC: PagerDuty + Datadog + Splunk + LLM
+
+What it does:
+- Input: PagerDuty incident URL
+- Fetches:
+    - PagerDuty incident + alerts
+    - Other recent incidents for same service
+    - Datadog logs:
+        - by error snippet
+        - by IDs (trace_id / request_id / correlation_id)
+    - Splunk logs:
+        - by error snippet
+        - by IDs
+- Uses an LLM to:
+    - Detect potential duplicate incidents
+    - Extract a canonical error
+    - Infer where the error originates
+    - Suggest next debugging steps
+
+Dependencies:
+    pip install fastapi uvicorn httpx "openai>=1.0.0"
+
+Environment variables (export or put in a .env and export from there):
+    PAGERDUTY_API_KEY=...
+    DD_API_KEY=...
+    DD_APP_KEY=...
+    SPLUNK_BASE_URL=https://your-splunk:8089
+    SPLUNK_USERNAME=...
+    SPLUNK_PASSWORD=...
+    OPENAI_API_KEY=...
+    LLM_MODEL=gpt-4.1-mini     # optional override
+
+Run API server:
+    uvicorn poc:app --reload
+
+Test via curl:
+    curl -X POST http://localhost:8000/analyze-incident-url \
+      -H "Content-Type: application/json" \
+      -d '{"pagerduty_url": "https://yourcompany.pagerduty.com/incidents/PIJ90N7"}'
+
+CLI mode:
+    python poc.py https://yourcompany.pagerduty.com/incidents/PIJ90N7
+"""
+
+import os
+import re
+import sys
+import json
+import asyncio
+import datetime as dt
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, quote
+
+import httpx
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+# OpenAI SDK v1 style
+try:
+    from openai import OpenAI
+    _OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+except Exception as _e:  # noqa: F841
+    _OPENAI_CLIENT = None  # will error when used if not set
+
+# -------------------------
+# Config / constants
+# -------------------------
+
+PAGERDUTY_API_URL = "https://api.pagerduty.com"
+PAGERDUTY_API_KEY = os.getenv("PAGERDUTY_API_KEY")
+
+DD_API_URL = "https://api.datadoghq.com/api/v2"
+DD_API_KEY = os.getenv("DD_API_KEY")
+DD_APP_KEY = os.getenv("DD_APP_KEY")
+
+SPLUNK_BASE_URL = os.getenv("SPLUNK_BASE_URL")  # e.g. https://your-splunk:8089
+SPLUNK_USERNAME = os.getenv("SPLUNK_USERNAME")
+SPLUNK_PASSWORD = os.getenv("SPLUNK_PASSWORD")
+
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini")  # default model
+
+# -------------------------
+# Utility helpers
+# -------------------------
+
+def extract_incident_id_from_url(url: str) -> Optional[str]:
+    """
+    Given a PagerDuty incident URL like:
+        https://yourcompany.pagerduty.com/incidents/PIJ90N7
+    return 'PIJ90N7' or None if it doesn't look right.
+    """
+    try:
+        parsed = urlparse(url)
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2 and parts[0].lower() == "incidents":
+            return parts[1]
+        return None
+    except Exception:
+        return None
+
+
+# Pattern to strip variable tokens (UUID/hex/IP/large numbers) for signatures
+_VAR_PATTERN = re.compile(
+    r"\b([0-9a-f]{8,}|\d{3,}|\d+\.\d+\.\d+\.\d+)\b",
+    re.IGNORECASE,
+)
+
+def build_error_signature(alert: Dict[str, Any]) -> str:
+    """
+    Naive error signature builder from a PagerDuty alert.
+
+    Uses:
+        alert['summary']
+        alert['body']['details'] (if present)
+
+    Then:
+        - lowercases
+        - strips variable tokens (IDs, IPs, long hex)
+        - collapses whitespace
+
+    The goal is to get a stable "shape" for dedupe, even if
+    trace IDs / timestamps vary.
+    """
+    summary = alert.get("summary") or ""
+    body = alert.get("body", {})
+    details = ""
+    if isinstance(body, dict):
+        details = body.get("details") or ""
+    text = f"{summary} {details}".strip().lower()
+
+    text = _VAR_PATTERN.sub("<X>", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def iso_to_dt(iso_str: Optional[str]) -> dt.datetime:
+    """
+    Convert ISO8601 string (PagerDuty style) to datetime (UTC).
+    If missing or invalid, return now().
+    """
+    if not iso_str:
+        return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+    try:
+        # PD often uses 'Z' for UTC; replace it for fromisoformat
+        return dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except Exception:
+        return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+
+
+# -------------------------
+# Correlation ID extraction
+# -------------------------
+
+ID_PATTERNS = [
+    r"\btrace_id[:= ]+([0-9a-fA-F\-]{8,})",
+    r"\btrace\.id[:= ]+([0-9a-fA-F\-]{8,})",
+    r"\brequest_id[:= ]+([0-9a-fA-F\-]{8,})",
+    r"\brequest\.id[:= ]+([0-9a-fA-F\-]{8,})",
+    r"\bcorrelation_id[:= ]+([0-9a-fA-F\-]{8,})",
+    r"\bcorrelation\.id[:= ]+([0-9a-fA-F\-]{8,})",
+]
+
+def extract_candidate_ids_from_alert(alert: Dict[str, Any]) -> List[str]:
+    """
+    Grab possible correlation IDs from an alert's summary + body details/contexts.
+    Very heuristic, but good enough for a POC.
+    """
+    s = (alert.get("summary") or "") + " "
+    body = alert.get("body") or {}
+    if isinstance(body, dict):
+        s += " " + str(body.get("details") or "")
+        s += " " + str(body.get("contexts") or "")
+
+    ids: set[str] = set()
+    for pattern in ID_PATTERNS:
+        for match in re.findall(pattern, s):
+            ids.add(match.strip())
+    return list(ids)
+
+
+# -------------------------
+# PagerDuty connectors
+# -------------------------
+
+def _pd_headers() -> Dict[str, str]:
+    if not PAGERDUTY_API_KEY:
+        raise RuntimeError("PAGERDUTY_API_KEY env var is not set.")
+    return {
+        "Authorization": f"Token token={PAGERDUTY_API_KEY}",
+        "Accept": "application/vnd.pagerduty+json;version=2",
+        "Content-Type": "application/json",
+    }
+
+
+async def pd_get_incident(incident_id: str) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{PAGERDUTY_API_URL}/incidents/{incident_id}",
+            headers=_pd_headers(),
+        )
+        resp.raise_for_status()
+        return resp.json().get("incident", {})
+
+
+async def pd_get_incident_alerts(incident_id: str) -> List[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{PAGERDUTY_API_URL}/incidents/{incident_id}/alerts",
+            headers=_pd_headers(),
+        )
+        resp.raise_for_status()
+        return resp.json().get("alerts", [])
+
+
+async def pd_list_recent_incidents_for_service(
+    service_id: str,
+    days: int = 7,
+    max_per_page: int = 25,
+) -> List[Dict[str, Any]]:
+    """
+    Very simple: list recent resolved incidents for the given service over last N days.
+    No pagination logic (POC), just first page.
+    """
+    since = (dt.datetime.utcnow() - dt.timedelta(days=days)).isoformat() + "Z"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{PAGERDUTY_API_URL}/incidents",
+            headers=_pd_headers(),
+            params={
+                "service_ids[]": service_id,
+                "since": since,
+                "statuses[]": "resolved",
+                "limit": max_per_page,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json().get("incidents", [])
+
+
+# -------------------------
+# Datadog connector (logs)
+# -------------------------
+
+def _dd_headers() -> Dict[str, str]:
+    if not DD_API_KEY or not DD_APP_KEY:
+        raise RuntimeError("DD_API_KEY or DD_APP_KEY env vars not set.")
+    return {
+        "DD-API-KEY": DD_API_KEY,
+        "DD-APPLICATION-KEY": DD_APP_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+async def dd_search_error_logs(
+    service: str,
+    error_snippet: str,
+    start_ts_ms: int,
+    end_ts_ms: int,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Search Datadog logs for a given service and error snippet in a time window.
+    Times are in ms since epoch (Datadog v2 style).
+    """
+    query = f'service:{service} status:error "{error_snippet}"'
+    payload = {
+        "filter": {
+            "from": start_ts_ms,
+            "to": end_ts_ms,
+            "query": query,
+        },
+        "page": {"limit": limit},
+        "sort": "timestamp",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{DD_API_URL}/logs/events/search",
+            headers=_dd_headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        events = data.get("data", [])
+        results: List[Dict[str, Any]] = []
+        for e in events:
+            attrs = e.get("attributes", {})
+            results.append(
+                {
+                    "timestamp": attrs.get("timestamp"),
+                    "message": attrs.get("message"),
+                    "status": attrs.get("status"),
+                }
+            )
+        return results
+
+
+async def dd_search_by_ids(
+    service: str,
+    ids: List[str],
+    start_ts_ms: int,
+    end_ts_ms: int,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """
+    Search Datadog logs for given service using a list of correlation IDs.
+    We build a query like:
+        service:svc status:error (trace_id:id1 OR request_id:id1 OR ...)
+    """
+    if not ids:
+        return []
+
+    id_terms: List[str] = []
+    for _id in ids:
+        id_terms.append(f'trace_id:{_id}')
+        id_terms.append(f'request_id:{_id}')
+        id_terms.append(f'correlation_id:{_id}')
+    id_query = " OR ".join(id_terms)
+    query = f'service:{service} status:error ({id_query})'
+
+    payload = {
+        "filter": {
+            "from": start_ts_ms,
+            "to": end_ts_ms,
+            "query": query,
+        },
+        "page": {"limit": limit},
+        "sort": "timestamp",
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            f"{DD_API_URL}/logs/events/search",
+            headers=_dd_headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        events = data.get("data", [])
+        results: List[Dict[str, Any]] = []
+        for e in events:
+            attrs = e.get("attributes", {})
+            results.append(
+                {
+                    "timestamp": attrs.get("timestamp"),
+                    "message": attrs.get("message"),
+                    "status": attrs.get("status"),
+                }
+            )
+        return results
+
+
+# -------------------------
+# Splunk connector (search)
+# -------------------------
+
+async def splunk_search_error_snippet(
+    service: str,
+    snippet: str,
+    earliest: str = "-30m",
+    latest: str = "now",
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Very minimal Splunk search:
+        search index=app_logs service="<service>" "<snippet>" | head <limit>
+
+    NOTE: verify=False to skip SSL verification for POC (change in prod).
+    """
+    if not (SPLUNK_BASE_URL and SPLUNK_USERNAME and SPLUNK_PASSWORD):
+        # For POC, quietly return empty if not configured.
+        return []
+
+    query = f'search index=app_logs service="{service}" "{snippet}" | head {limit}'
+    auth = (SPLUNK_USERNAME, SPLUNK_PASSWORD)
+
+    async with httpx.AsyncClient(timeout=30, verify=False) as client:
+        # 1. create search job
+        job_resp = await client.post(
+            f"{SPLUNK_BASE_URL}/services/search/jobs",
+            data={
+                "search": query,
+                "earliest_time": earliest,
+                "latest_time": latest,
+                "output_mode": "json",
+            },
+            auth=auth,
+        )
+        job_resp.raise_for_status()
+        job_data = job_resp.json()
+        sid = job_data.get("sid")
+        if not sid:
+            return []
+
+        # 2. get results (POC: simple single fetch)
+        res_resp = await client.get(
+            f"{SPLUNK_BASE_URL}/services/search/jobs/{sid}/results",
+            params={"output_mode": "json"},
+            auth=auth,
+        )
+        res_resp.raise_for_status()
+        data = res_resp.json()
+        results = data.get("results", [])
+        return [
+            {
+                "timestamp": r.get("_time"),
+                "message": r.get("_raw"),
+            }
+            for r in results
+        ]
+
+
+async def splunk_search_by_ids(
+    service: str,
+    ids: List[str],
+    earliest: str = "-30m",
+    latest: str = "now",
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """
+    Splunk search using correlation IDs across fields trace_id/request_id/correlation_id.
+    Query shape:
+        search index=app_logs service="svc" (trace_id="id1" OR request_id="id1" OR ...) | head <limit>
+    """
+    if not ids or not (SPLUNK_BASE_URL and SPLUNK_USERNAME and SPLUNK_PASSWORD):
+        return []
+
+    clauses = []
+    for _id in ids:
+        clauses.append(f'trace_id="{_id}"')
+        clauses.append(f'request_id="{_id}"')
+        clauses.append(f'correlation_id="{_id}"')
+    id_clause = " OR ".join(clauses)
+    query = f'search index=app_logs service="{service}" ({id_clause}) | head {limit}'
+    auth = (SPLUNK_USERNAME, SPLUNK_PASSWORD)
+
+    async with httpx.AsyncClient(timeout=30, verify=False) as client:
+        job_resp = await client.post(
+            f"{SPLUNK_BASE_URL}/services/search/jobs",
+            data={
+                "search": query,
+                "earliest_time": earliest,
+                "latest_time": latest,
+                "output_mode": "json",
+            },
+            auth=auth,
+        )
+        job_resp.raise_for_status()
+        job_data = job_resp.json()
+        sid = job_data.get("sid")
+        if not sid:
+            return []
+
+        res_resp = await client.get(
+            f"{SPLUNK_BASE_URL}/services/search/jobs/{sid}/results",
+            params={"output_mode": "json"},
+            auth=auth,
+        )
+        res_resp.raise_for_status()
+        data = res_resp.json()
+        results = data.get("results", [])
+        return [
+            {
+                "timestamp": r.get("_time"),
+                "message": r.get("_raw"),
+            }
+            for r in results
+        ]
+
+
+# -------------------------
+# Duplicate detection logic
+# -------------------------
+
+async def find_pd_duplicates_for_incident(
+    target_incident_id: str,
+    recent_days: int = 7,
+) -> Dict[str, Any]:
+    """
+    Orchestrates:
+        - fetch target incident + alerts
+        - list recent incidents for same service
+        - fetch their alerts
+        - compute normalized error signatures
+        - find duplicates that share the same signature as the target
+    Returns dict with keys:
+        target_incident, target_alerts, duplicates, signature, service_name
+    """
+    target_incident = await pd_get_incident(target_incident_id)
+    target_alerts = await pd_get_incident_alerts(target_incident_id)
+
+    if not target_incident:
+        return {
+            "target_incident": {},
+            "target_alerts": [],
+            "duplicates": [],
+            "signature": None,
+            "service_name": None,
+        }
+
+    if not target_alerts:
+        return {
+            "target_incident": target_incident,
+            "target_alerts": [],
+            "duplicates": [],
+            "signature": None,
+            "service_name": None,
+        }
+
+    # build signature from first alert (POC)
+    target_sig = build_error_signature(target_alerts[0])
+
+    service_obj = target_incident.get("service") or {}
+    service_id = None
+    service_name = None
+    if isinstance(service_obj, dict):
+        service_id = service_obj.get("id")
+        service_name = service_obj.get("summary")
+
+    duplicates: List[Dict[str, Any]] = []
+
+    if service_id:
+        recent_incidents = await pd_list_recent_incidents_for_service(
+            service_id=service_id,
+            days=recent_days,
+        )
+        for inc in recent_incidents:
+            inc_id = inc.get("id")
+            if not inc_id or inc_id == target_incident_id:
+                continue
+            alerts = await pd_get_incident_alerts(inc_id)
+            if not alerts:
+                continue
+            sig = build_error_signature(alerts[0])
+            if sig == target_sig:
+                duplicates.append(
+                    {
+                        "incident": inc,
+                        "alerts": alerts,
+                        "signature": sig,
+                    }
+                )
+
+    return {
+        "target_incident": target_incident,
+        "target_alerts": target_alerts,
+        "duplicates": duplicates,
+        "signature": target_sig,
+        "service_name": service_name,
+    }
+
+
+# -------------------------
+# LLM logic
+# -------------------------
+
+async def call_llm_for_analysis(context: Dict[str, Any]) -> str:
+    """
+    Call the LLM with a structured context and get a Markdown explanation.
+    """
+    if _OPENAI_CLIENT is None:
+        raise RuntimeError(
+            "OpenAI client is not initialized. "
+            "Make sure OPENAI_API_KEY is set and openai>=1.0.0 is installed."
+        )
+
+    system_prompt = """You are an SRE assistant helping with production incidents.
+
+You receive JSON that includes:
+- target_incident (PagerDuty incident)
+- target_alerts (alerts for this incident, including any IDs or error messages)
+- duplicates (incidents with the same error signature)
+- datadog_logs_snippet (Datadog logs filtered by error snippet)
+- splunk_logs_snippet (Splunk logs filtered by error snippet)
+- datadog_logs_by_id (Datadog logs filtered by trace/request IDs)
+- splunk_logs_by_id (Splunk logs filtered by trace/request IDs)
+- signature (normalized error signature)
+
+Your job is to respond in Markdown with these sections:
+
+## Origin of the error
+- Which service/component appears to be the first place the error originates?
+- Mention endpoint or DB/queue if visible from the logs.
+
+## Exact error
+- Provide ONE canonical error line (or short phrase) that best represents the failure.
+- Quote it exactly from the logs if possible.
+
+## Duplicate / history check
+- Is this likely a duplicate of prior incidents?
+- If yes, list incident numbers and a one-line summary of how they were resolved (if visible).
+
+## How to debug next
+- 3–5 concrete next steps for a prod support engineer:
+  - which logs to open (Splunk/Datadog)
+  - which IDs to follow
+  - which service/owner to contact
+
+Keep it concise and practical."""
+
+    user_content = (
+        "Here is the JSON context for analysis:\n\n```json\n"
+        + json.dumps(context, indent=2)
+        + "\n```\n\nPlease analyze it."
+    )
+
+    resp = _OPENAI_CLIENT.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.2,
+    )
+
+    return resp.choices[0].message.content
+
+
+# -------------------------
+# Top-level orchestration
+# -------------------------
+
+async def analyze_pagerduty_url(pd_url: str) -> str:
+    """
+    Main orchestration function:
+        - parse incident ID
+        - find duplicates from PagerDuty
+        - extract correlation IDs from alerts
+        - derive time window & error snippet
+        - query Datadog + Splunk (snippet + IDs)
+        - call LLM to generate Markdown report
+    """
+    incident_id = extract_incident_id_from_url(pd_url)
+    if not incident_id:
+        return "I couldn't parse a PagerDuty incident ID from that URL."
+
+    # 1) PagerDuty: incident + duplicates
+    dedupe_ctx = await find_pd_duplicates_for_incident(incident_id)
+
+    target_incident = dedupe_ctx.get("target_incident") or {}
+    target_alerts = dedupe_ctx.get("target_alerts") or []
+    duplicates = dedupe_ctx.get("duplicates") or []
+    signature = dedupe_ctx.get("signature")
+    service_name = dedupe_ctx.get("service_name")
+
+    if not target_incident:
+        return f"I couldn't find incident '{incident_id}' in PagerDuty."
+
+    # 2) Extract candidate correlation IDs from alerts
+    candidate_ids: List[str] = []
+    for a in target_alerts:
+        candidate_ids.extend(extract_candidate_ids_from_alert(a))
+    candidate_ids = list(set(candidate_ids))  # dedupe
+
+    # 3) Compute time window around created_at
+    created_at = target_incident.get("created_at")
+    created_dt = iso_to_dt(created_at)
+    start_dt = created_dt - dt.timedelta(minutes=30)
+    end_dt = created_dt + dt.timedelta(minutes=15)
+
+    start_ts_ms = int(start_dt.timestamp() * 1000)
+    end_ts_ms = int(end_dt.timestamp() * 1000)
+
+    # 4) Error snippet: first few words of signature
+    error_snippet = ""
+    if signature:
+        error_snippet = " ".join(signature.split()[:8])
+
+    # 5) Collect logs
+    datadog_logs_snippet: List[Dict[str, Any]] = []
+    splunk_logs_snippet: List[Dict[str, Any]] = []
+    datadog_logs_by_id: List[Dict[str, Any]] = []
+    splunk_logs_by_id: List[Dict[str, Any]] = []
+
+    if service_name:
+        # By error snippet
+        if error_snippet:
+            try:
+                datadog_logs_snippet = await dd_search_error_logs(
+                    service=service_name,
+                    error_snippet=error_snippet,
+                    start_ts_ms=start_ts_ms,
+                    end_ts_ms=end_ts_ms,
+                    limit=10,
+                )
+            except Exception as e:
+                datadog_logs_snippet = [{"error": f"Datadog snippet query failed: {e}"}]
+
+            try:
+                splunk_logs_snippet = await splunk_search_error_snippet(
+                    service=service_name,
+                    snippet=error_snippet,
+                    earliest="-30m",
+                    latest="+15m",
+                    limit=10,
+                )
+            except Exception as e:
+                splunk_logs_snippet = [{"error": f"Splunk snippet query failed: {e}"}]
+
+        # By IDs
+        if candidate_ids:
+            try:
+                datadog_logs_by_id = await dd_search_by_ids(
+                    service=service_name,
+                    ids=candidate_ids,
+                    start_ts_ms=start_ts_ms,
+                    end_ts_ms=end_ts_ms,
+                    limit=50,
+                )
+            except Exception as e:
+                datadog_logs_by_id = [{"error": f"Datadog ID query failed: {e}"}]
+
+            try:
+                splunk_logs_by_id = await splunk_search_by_ids(
+                    service=service_name,
+                    ids=candidate_ids,
+                    earliest="-30m",
+                    latest="+15m",
+                    limit=50,
+                )
+            except Exception as e:
+                splunk_logs_by_id = [{"error": f"Splunk ID query failed: {e}"}]
+
+    # 6) Build context for LLM
+    context_for_llm = {
+        "pagerduty_url": pd_url,
+        "incident_id": incident_id,
+        "service_name": service_name,
+        "candidate_ids": candidate_ids,
+        "target_incident": target_incident,
+        "target_alerts": target_alerts,
+        "duplicates": [
+            {
+                "incident": d.get("incident"),
+                "signature": d.get("signature"),
+            }
+            for d in duplicates
+        ],
+        "signature": signature,
+        "datadog_logs_snippet": datadog_logs_snippet,
+        "splunk_logs_snippet": splunk_logs_snippet,
+        "datadog_logs_by_id": datadog_logs_by_id,
+        "splunk_logs_by_id": splunk_logs_by_id,
+    }
+
+    # 7) LLM summary
+    report = await call_llm_for_analysis(context_for_llm)
+    return report
+
+
+# -------------------------
+# FastAPI app
+# -------------------------
+
+app = FastAPI(title="Observability Copilot POC")
+
+
+class AnalyzeUrlRequest(BaseModel):
+    pagerduty_url: str
+
+
+class AnalyzeUrlResponse(BaseModel):
+    pagerduty_url: str
+    report: str
+
+
+@app.post("/analyze-incident-url", response_model=AnalyzeUrlResponse)
+async def analyze_incident_url_endpoint(body: AnalyzeUrlRequest):
+    report = await analyze_pagerduty_url(body.pagerduty_url)
+    return AnalyzeUrlResponse(pagerduty_url=body.pagerduty_url, report=report)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# -------------------------
+# CLI entrypoint
+# -------------------------
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print(
+            "Usage:\n"
+            "  python poc.py https://yourcompany.pagerduty.com/incidents/PIJ90N7\n"
+            "\nOr run as an API server:\n"
+            "  uvicorn poc:app --reload\n"
+        )
+        sys.exit(1)
+
+    url = sys.argv[1]
+    print(f"Analyzing PagerDuty incident URL: {url}\n")
+    markdown_report = asyncio.run(analyze_pagerduty_url(url))
+    print(markdown_report)
